@@ -3,7 +3,7 @@ services:
     name: detection-lab-api
     runtime: python
     rootDir: backend
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install flask flask-cors requests gunicorn
     startCommand: gunicorn app:app
     envVars:
       - key: FLASK_ENV
