@@ -696,43 +696,83 @@ def health():
 @app.route("/api/threat-intel")
 @rate_limit
 def threat_intel():
-    """Fetch live threat intel from abuse.ch URLhaus"""
+    """Fetch live threat intel from abuse.ch URLhaus — handles both old and new API formats"""
+    SAMPLE = [
+        {"url": "http://malware-dl.ru/payload.exe", "host": "malware-dl.ru",
+         "url_status": "online", "threat": "Emotet", "tags": ["banking", "trojan"],
+         "reporter": "abuse_ch", "date_added": "2024-03-15 08:00:00"},
+        {"url": "http://195.123.245.44/gate.php", "host": "195.123.245.44",
+         "url_status": "online", "threat": "AgentTesla", "tags": ["stealer", "rat"],
+         "reporter": "threatfox", "date_added": "2024-03-15 07:30:00"},
+        {"url": "http://update-cdn.fakems.com/svchost.exe", "host": "update-cdn.fakems.com",
+         "url_status": "online", "threat": "CobaltStrike", "tags": ["c2", "beacon"],
+         "reporter": "hunt_team", "date_added": "2024-03-15 06:00:00"},
+        {"url": "http://103.99.115.66/download", "host": "103.99.115.66",
+         "url_status": "offline", "threat": "AsyncRAT", "tags": ["rat"],
+         "reporter": "MalwareBazaar", "date_added": "2024-03-14 20:00:00"},
+        {"url": "http://payload-delivery.ru/1.exe", "host": "payload-delivery.ru",
+         "url_status": "online", "threat": "Qakbot", "tags": ["banking", "dropper"],
+         "reporter": "abuse_ch", "date_added": "2024-03-14 18:00:00"},
+        {"url": "http://45.142.212.100/wp-content/themes/x.exe", "host": "45.142.212.100",
+         "url_status": "online", "threat": "IcedID", "tags": ["banking", "loader"],
+         "reporter": "abuse_ch", "date_added": "2024-03-14 16:00:00"},
+        {"url": "http://185.220.101.45/implant.bin", "host": "185.220.101.45",
+         "url_status": "online", "threat": "CobaltStrike", "tags": ["c2", "tor"],
+         "reporter": "hunt_team", "date_added": "2024-03-14 14:00:00"},
+        {"url": "http://evil-c2.net/stage2.ps1", "host": "evil-c2.net",
+         "url_status": "online", "threat": "AsyncRAT", "tags": ["rat", "powershell"],
+         "reporter": "threatfox", "date_added": "2024-03-14 12:00:00"},
+    ]
+
     try:
         resp = requests.post(
             "https://urlhaus-api.abuse.ch/v1/urls/recent/limit/20/",
             data="", headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=8
         )
+        resp.raise_for_status()
         data = resp.json()
-        urls = data.get("urls", [])
+
+        # Handle both response formats:
+        # Old: {"urls": [...]}
+        # New: {"data": [...]} or {"query_status": "ok", "urls": [...]}
+        urls = data.get("urls") or data.get("data") or []
+
+        # Normalise field names across API versions
+        normalised = []
+        for u in urls:
+            normalised.append({
+                "url":        u.get("url", u.get("url_str", "")),
+                "host":       u.get("host", u.get("url_host", u.get("url", "").split("/")[2] if "http" in u.get("url","") else "unknown")),
+                "url_status": u.get("url_status", u.get("url_status_code", "unknown")),
+                "threat":     u.get("threat", u.get("malware", u.get("tags", ["unknown"])[0] if u.get("tags") else "unknown")),
+                "tags":       u.get("tags") or u.get("url_tags") or [],
+                "reporter":   u.get("reporter", u.get("url_reporter", "abuse.ch")),
+                "date_added": u.get("date_added", u.get("url_added", "")),
+            })
+
+        # If API returned empty list, use sample (API may be throttling or changed schema)
+        if not normalised:
+            audit_log("threat_intel_empty", "abuse.ch returned empty — using sample data")
+            raise ValueError("empty response")
+
         stats = {
-            "total": len(urls),
-            "online": sum(1 for u in urls if u.get("url_status") == "online"),
-            "malware_families": list(set(t for u in urls for t in (u.get("tags") or []))),
+            "total": len(normalised),
+            "online": sum(1 for u in normalised if str(u.get("url_status","")).lower() == "online"),
+            "malware_families": list(set(t for u in normalised for t in (u.get("tags") or []) if t)),
             "source": "abuse.ch URLhaus (live)"
         }
-        return jsonify({"success": True, "stats": stats, "urls": urls[:15]})
+        return jsonify({"success": True, "stats": stats, "urls": normalised[:15]})
+
     except Exception as e:
-        # Return curated sample data if API is unreachable
-        sample = [
-            {"url": "http://malware-dl.ru/payload.exe", "host": "malware-dl.ru",
-             "url_status": "online", "threat": "Emotet", "tags": ["banking", "trojan"],
-             "reporter": "abuse_ch", "date_added": "2024-03-15 08:00:00"},
-            {"url": "http://195.123.245.44/gate.php", "host": "195.123.245.44",
-             "url_status": "online", "threat": "AgentTesla", "tags": ["stealer", "rat"],
-             "reporter": "threatfox", "date_added": "2024-03-15 07:30:00"},
-            {"url": "http://update-cdn.fakems.com/svchost.exe", "host": "update-cdn.fakems.com",
-             "url_status": "online", "threat": "CobaltStrike", "tags": ["c2", "beacon"],
-             "reporter": "hunt_team", "date_added": "2024-03-15 06:00:00"},
-            {"url": "http://103.99.115.66/download", "host": "103.99.115.66",
-             "url_status": "offline", "threat": "AsyncRAT", "tags": ["rat"],
-             "reporter": "MalwareBazaar", "date_added": "2024-03-14 20:00:00"},
-            {"url": "http://payload-delivery.ru/1.exe", "host": "payload-delivery.ru",
-             "url_status": "online", "threat": "Qakbot", "tags": ["banking", "dropper"],
-             "reporter": "abuse_ch", "date_added": "2024-03-14 18:00:00"},
-        ]
-        return jsonify({"success": False, "source": "cached (API offline)", "urls": sample,
-                        "stats": {"total": 847, "online": 312, "malware_families": ["Emotet","AgentTesla","Qakbot","AsyncRAT","CobaltStrike"]}})
+        audit_log("threat_intel_fallback", str(e)[:64])
+        stats = {
+            "total": len(SAMPLE),
+            "online": sum(1 for u in SAMPLE if u.get("url_status") == "online"),
+            "malware_families": list(set(t for u in SAMPLE for t in (u.get("tags") or []))),
+            "source": "cached sample (live API unavailable)"
+        }
+        return jsonify({"success": False, "stats": stats, "urls": SAMPLE})
 
 
 @app.route("/api/check-ioc", methods=["POST"])
