@@ -549,8 +549,12 @@ def entropy_api():
 
 
 if __name__ == "__main__":
+    import os
+    port = int(os.environ.get("PORT", 5050))
+    debug = os.environ.get("FLASK_ENV") != "production"
     print("\n╔══════════════════════════════════════════╗")
     print("║   Detection Engineering Lab — Backend    ║")
     print(f"║   Rules loaded: {len(DETECTION_RULES)}  |  Techniques: {len(MITRE_COVERAGE)}    ║")
+    print(f"║   Port: {port:<34}║")
     print("╚══════════════════════════════════════════╝\n")
-    app.run(debug=True, port=5050)
+    app.run(debug=debug, host="0.0.0.0", port=port)
