@@ -939,27 +939,53 @@ def export_sigma(rule_id):
 
     detection = detection_map.get(rule_id, {"selection": {"EventID": 4688}, "condition": "selection"})
 
-    import yaml
-    sigma = {
-        "title": rule.name,
-        "id": f"det-lab-{rule_id.lower()}",
-        "status": "experimental",
-        "description": rule.description,
-        "references": [f"https://attack.mitre.org/techniques/{rule.mitre_id.replace('.', '/')}/"],
-        "author": "Krutik — Detection Engineering Lab",
-        "date": "2024/03/15",
-        "modified": "2024/03/15",
-        "tags": [
-            f"attack.{rule.tactic.lower().replace(' ', '_').replace('&', 'and')}",
-            f"attack.{rule.mitre_id.lower()}"
-        ],
-        "logsource": logsource,
-        "detection": detection,
-        "falsepositives": ["Legitimate administrative activity", "Security scanning tools"],
-        "level": sev_map.get(rule.severity, "medium")
-    }
+    # Pure-Python YAML builder — no PyYAML dependency
+    def _yl(v, indent=0):
+        pad = "  " * indent
+        if isinstance(v, dict):
+            lines = []
+            for k, val in v.items():
+                if isinstance(val, (dict, list)):
+                    lines.append(f"{pad}{k}:")
+                    lines.append(_yl(val, indent + 1))
+                else:
+                    lines.append(f"{pad}{k}: {_yl(val, 0)}")
+            return "\n".join(lines)
+        elif isinstance(v, list):
+            return "\n".join(f"{pad}- {_yl(i, 0)}" for i in v)
+        elif isinstance(v, str):
+            if any(c in v for c in [':', '#', '{', '}', '[', ']', '&', '*', '|']):
+                return f"'{v.replace(chr(39), chr(39)*2)}'"
+            return v
+        elif isinstance(v, bool):
+            return "true" if v else "false"
+        return str(v)
 
-    yaml_str = yaml.dump(sigma, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    tactic_tag = rule.tactic.lower().replace(" ", "_").replace("&", "and")
+    lines = [
+        "---",
+        f"title: '{rule.name}'",
+        f"id: det-lab-{rule_id.lower()}",
+        "status: experimental",
+        f"description: '{rule.description}'",
+        "references:",
+        f"  - 'https://attack.mitre.org/techniques/{rule.mitre_id.replace(".", "/")}/'",
+        "author: 'Krutik - Detection Engineering Lab'",
+        "date: 2024/03/15",
+        "tags:",
+        f"  - attack.{tactic_tag}",
+        f"  - attack.{rule.mitre_id.lower()}",
+        "logsource:",
+        _yl(logsource, 1),
+        "detection:",
+        _yl(detection, 1),
+        "falsepositives:",
+        "  - Legitimate administrative activity",
+        "  - Security scanning tools",
+        f"level: {sev_map.get(rule.severity, 'medium')}",
+        "",
+    ]
+    yaml_str = "\n".join(lines)
     from flask import Response
     return Response(yaml_str, mimetype="text/yaml",
                     headers={"Content-Disposition": f"attachment; filename={rule_id}_sigma.yml"})
