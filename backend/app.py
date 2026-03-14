@@ -696,7 +696,8 @@ def health():
 @app.route("/api/threat-intel")
 @rate_limit
 def threat_intel():
-    """Fetch live threat intel from abuse.ch URLhaus — handles both old and new API formats"""
+    """Fetch live threat intel — tries ThreatFox first, then URLhaus, then sample fallback"""
+
     SAMPLE = [
         {"url": "http://malware-dl.ru/payload.exe", "host": "malware-dl.ru",
          "url_status": "online", "threat": "Emotet", "tags": ["banking", "trojan"],
@@ -724,55 +725,84 @@ def threat_intel():
          "reporter": "threatfox", "date_added": "2024-03-14 12:00:00"},
     ]
 
+    def build_stats(urls, source):
+        return {
+            "total": len(urls),
+            "online": sum(1 for u in urls if str(u.get("url_status","")).lower() == "online"),
+            "malware_families": list(set(t for u in urls for t in (u.get("tags") or []) if t)),
+            "source": source
+        }
+
+    # ── Source 1: ThreatFox recent IOCs (JSON API, very reliable) ──
     try:
-        resp = requests.post(
-            "https://urlhaus-api.abuse.ch/v1/urls/recent/limit/20/",
+        tf_resp = requests.post(
+            "https://threatfox-api.abuse.ch/api/v1/",
+            json={"query": "get_iocs", "days": 1},
+            headers={"Content-Type": "application/json"},
+            timeout=8
+        )
+        tf_resp.raise_for_status()
+        tf_data = tf_resp.json()
+        iocs = tf_data.get("data") or []
+        if iocs:
+            normalised = []
+            for ioc in iocs[:15]:
+                host = ioc.get("ioc_value", "")
+                # strip port if present
+                if ":" in host and not host.startswith("http"):
+                    host = host.split(":")[0]
+                threat = ioc.get("malware", ioc.get("threat_type", "unknown"))
+                tags = [ioc.get("threat_type", ""), ioc.get("malware_printable", "")]
+                tags = [t for t in tags if t]
+                normalised.append({
+                    "url":        ioc.get("ioc_value", ""),
+                    "host":       host,
+                    "url_status": "online",
+                    "threat":     threat,
+                    "tags":       tags,
+                    "reporter":   ioc.get("reporter", "threatfox"),
+                    "date_added": ioc.get("first_seen", ""),
+                })
+            audit_log("threat_intel_source", "threatfox_live")
+            return jsonify({"success": True, "stats": build_stats(normalised, "ThreatFox API (live)"), "urls": normalised})
+    except Exception as e:
+        audit_log("threatfox_failed", str(e)[:64])
+
+    # ── Source 2: URLhaus recent URLs ──
+    try:
+        uh_resp = requests.post(
+            "https://urlhaus-api.abuse.ch/v1/urls/recent/limit/15/",
             data="", headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=8
         )
-        resp.raise_for_status()
-        data = resp.json()
-
-        # Handle both response formats:
-        # Old: {"urls": [...]}
-        # New: {"data": [...]} or {"query_status": "ok", "urls": [...]}
-        urls = data.get("urls") or data.get("data") or []
-
-        # Normalise field names across API versions
-        normalised = []
-        for u in urls:
-            normalised.append({
-                "url":        u.get("url", u.get("url_str", "")),
-                "host":       u.get("host", u.get("url_host", u.get("url", "").split("/")[2] if "http" in u.get("url","") else "unknown")),
-                "url_status": u.get("url_status", u.get("url_status_code", "unknown")),
-                "threat":     u.get("threat", u.get("malware", u.get("tags", ["unknown"])[0] if u.get("tags") else "unknown")),
-                "tags":       u.get("tags") or u.get("url_tags") or [],
-                "reporter":   u.get("reporter", u.get("url_reporter", "abuse.ch")),
-                "date_added": u.get("date_added", u.get("url_added", "")),
-            })
-
-        # If API returned empty list, use sample (API may be throttling or changed schema)
-        if not normalised:
-            audit_log("threat_intel_empty", "abuse.ch returned empty — using sample data")
-            raise ValueError("empty response")
-
-        stats = {
-            "total": len(normalised),
-            "online": sum(1 for u in normalised if str(u.get("url_status","")).lower() == "online"),
-            "malware_families": list(set(t for u in normalised for t in (u.get("tags") or []) if t)),
-            "source": "abuse.ch URLhaus (live)"
-        }
-        return jsonify({"success": True, "stats": stats, "urls": normalised[:15]})
-
+        uh_resp.raise_for_status()
+        uh_data = uh_resp.json()
+        urls = uh_data.get("urls") or uh_data.get("data") or []
+        if urls:
+            normalised = []
+            for u in urls:
+                raw_url = u.get("url", "")
+                try:
+                    host = raw_url.split("/")[2] if "http" in raw_url else raw_url
+                except Exception:
+                    host = raw_url
+                normalised.append({
+                    "url":        raw_url,
+                    "host":       u.get("host", host),
+                    "url_status": u.get("url_status", "unknown"),
+                    "threat":     (u.get("tags") or ["unknown"])[0],
+                    "tags":       u.get("tags") or [],
+                    "reporter":   u.get("reporter", "abuse.ch"),
+                    "date_added": u.get("date_added", ""),
+                })
+            audit_log("threat_intel_source", "urlhaus_live")
+            return jsonify({"success": True, "stats": build_stats(normalised, "URLhaus API (live)"), "urls": normalised})
     except Exception as e:
-        audit_log("threat_intel_fallback", str(e)[:64])
-        stats = {
-            "total": len(SAMPLE),
-            "online": sum(1 for u in SAMPLE if u.get("url_status") == "online"),
-            "malware_families": list(set(t for u in SAMPLE for t in (u.get("tags") or []))),
-            "source": "cached sample (live API unavailable)"
-        }
-        return jsonify({"success": False, "stats": stats, "urls": SAMPLE})
+        audit_log("urlhaus_failed", str(e)[:64])
+
+    # ── Source 3: Sample fallback ──
+    audit_log("threat_intel_source", "sample_fallback")
+    return jsonify({"success": False, "stats": build_stats(SAMPLE, "cached sample (both APIs unavailable)"), "urls": SAMPLE})
 
 
 @app.route("/api/check-ioc", methods=["POST"])
