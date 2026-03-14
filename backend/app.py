@@ -733,7 +733,58 @@ def threat_intel():
             "source": source
         }
 
-    # ── Source 1: ThreatFox recent IOCs (JSON API, very reliable) ──
+    # ── Source 1: OTX AlienVault (primary — API key authenticated) ──
+    OTX_KEY = os.environ.get("OTX_API_KEY", "")
+    if OTX_KEY:
+        try:
+            otx_resp = requests.get(
+                "https://otx.alienvault.com/api/v1/pulses/subscribed?limit=5&page=1",
+                headers={"X-OTX-API-KEY": OTX_KEY},
+                timeout=10
+            )
+            otx_resp.raise_for_status()
+            otx_data = otx_resp.json()
+            pulses = otx_data.get("results", [])
+            normalised = []
+            for pulse in pulses:
+                pulse_name = pulse.get("name", "Unknown")
+                tags = pulse.get("tags", [])[:3]
+                for indicator in pulse.get("indicators", [])[:3]:
+                    ioc_type = indicator.get("type", "")
+                    # Only show URL, domain, IPv4 types
+                    if ioc_type not in ("URL", "domain", "IPv4", "hostname"):
+                        continue
+                    ioc_val = indicator.get("indicator", "")
+                    host = ioc_val
+                    if ioc_type == "URL":
+                        try:
+                            host = ioc_val.split("/")[2]
+                        except Exception:
+                            host = ioc_val
+                    normalised.append({
+                        "url":        ioc_val,
+                        "host":       host,
+                        "url_status": "online",
+                        "threat":     pulse_name[:30],
+                        "tags":       tags or [ioc_type.lower()],
+                        "reporter":   pulse.get("author_name", "OTX"),
+                        "date_added": indicator.get("created", pulse.get("created", "")),
+                    })
+                if len(normalised) >= 15:
+                    break
+            if normalised:
+                audit_log("threat_intel_source", "otx_live")
+                return jsonify({
+                    "success": True,
+                    "stats": build_stats(normalised, "AlienVault OTX (live)"),
+                    "urls": normalised[:15]
+                })
+        except Exception as e:
+            audit_log("otx_failed", str(e)[:64])
+    else:
+        audit_log("otx_skipped", "OTX_API_KEY not set in environment")
+
+    # ── Source 2: ThreatFox recent IOCs ──
     try:
         tf_resp = requests.post(
             "https://threatfox-api.abuse.ch/api/v1/",
@@ -748,7 +799,6 @@ def threat_intel():
             normalised = []
             for ioc in iocs[:15]:
                 host = ioc.get("ioc_value", "")
-                # strip port if present
                 if ":" in host and not host.startswith("http"):
                     host = host.split(":")[0]
                 threat = ioc.get("malware", ioc.get("threat_type", "unknown"))
@@ -768,7 +818,7 @@ def threat_intel():
     except Exception as e:
         audit_log("threatfox_failed", str(e)[:64])
 
-    # ── Source 2: URLhaus recent URLs ──
+    # ── Source 3: URLhaus ──
     try:
         uh_resp = requests.post(
             "https://urlhaus-api.abuse.ch/v1/urls/recent/limit/15/",
@@ -800,9 +850,9 @@ def threat_intel():
     except Exception as e:
         audit_log("urlhaus_failed", str(e)[:64])
 
-    # ── Source 3: Sample fallback ──
+    # ── Source 4: Sample fallback ──
     audit_log("threat_intel_source", "sample_fallback")
-    return jsonify({"success": False, "stats": build_stats(SAMPLE, "cached sample (both APIs unavailable)"), "urls": SAMPLE})
+    return jsonify({"success": False, "stats": build_stats(SAMPLE, "Sample IOCs — curated dataset"), "urls": SAMPLE})
 
 
 @app.route("/api/check-ioc", methods=["POST"])
