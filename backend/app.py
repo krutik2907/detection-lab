@@ -25,7 +25,9 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 64 * 1024
 
 # CORS — restrict origins (portfolio: allow GitHub Pages + localhost)
-CORS(app, origins=["https://krutik2907.github.io", "http://localhost"],
+CORS(app, origins=["https://krutik2907.github.io",
+                   "http://localhost:5050", "http://localhost:3000",
+                   "http://127.0.0.1:5050", "http://127.0.0.1"],
      methods=["GET", "POST"], max_age=600)
 
 # ── Rate Limiter (in-memory, per-IP) ──────────────────────────
@@ -738,7 +740,7 @@ def threat_intel():
     if OTX_KEY:
         try:
             otx_resp = requests.get(
-                "https://otx.alienvault.com/api/v1/pulses/subscribed?limit=5&page=1",
+                "https://otx.alienvault.com/api/v1/pulses/subscribed?limit=10&page=1",
                 headers={"X-OTX-API-KEY": OTX_KEY},
                 timeout=10
             )
@@ -749,10 +751,10 @@ def threat_intel():
             for pulse in pulses:
                 pulse_name = pulse.get("name", "Unknown")
                 tags = pulse.get("tags", [])[:3]
-                for indicator in pulse.get("indicators", [])[:3]:
+                for indicator in pulse.get("indicators", [])[:5]:
                     ioc_type = indicator.get("type", "")
-                    # Only show URL, domain, IPv4 types
-                    if ioc_type not in ("URL", "domain", "IPv4", "hostname"):
+                    # Show network-based IOC types
+                    if ioc_type not in ("URL", "domain", "IPv4", "hostname", "IPv6", "FQDN", "URI"):
                         continue
                     ioc_val = indicator.get("indicator", "")
                     host = ioc_val
