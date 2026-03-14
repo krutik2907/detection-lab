@@ -26,6 +26,7 @@ app.config['MAX_CONTENT_LENGTH'] = 64 * 1024
 
 # CORS — restrict origins (portfolio: allow GitHub Pages + localhost)
 CORS(app, origins=["https://krutik2907.github.io",
+                   "https://detection-lab-api-production.up.railway.app",
                    "http://localhost:5050", "http://localhost:3000",
                    "http://127.0.0.1:5050", "http://127.0.0.1"],
      methods=["GET", "POST"], max_age=600)
