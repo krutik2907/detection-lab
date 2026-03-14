@@ -176,12 +176,6 @@
   <div class="nav-item" onclick="showPanel('simulator', this)">
     <span class="nav-icon">🎯</span> Log Simulator
   </div>
-  <div class="nav-item" onclick="showPanel('sigma', this)">
-    <span class="nav-icon">📦</span> Sigma Export
-  </div>
-  <div class="nav-item" onclick="showPanel('art', this)">
-    <span class="nav-icon">⚡</span> Atomic Red Team
-  </div>
   <div class="nav-section">Engineering</div>
   <div class="nav-item" onclick="showPanel('rules', this)">
     <span class="nav-icon">📐</span> Rule Builder
@@ -264,20 +258,11 @@
           <div>
             <label>Attack Scenario</label>
             <select id="scenario-select">
-              <optgroup label="Original Scenarios">
               <option value="powershell">PowerShell Obfuscated Execution (T1059.001)</option>
               <option value="bruteforce">RDP Brute Force Attack (T1110.001)</option>
               <option value="dns_tunneling">DNS Tunneling / C2 over DNS (T1071.004)</option>
               <option value="lateral">Pass-the-Hash Lateral Movement (T1550.002)</option>
               <option value="ransomware">Ransomware File Encryption (T1486)</option>
-              </optgroup>
-              <optgroup label="New Scenarios">
-              <option value="kerberoasting">Kerberoasting — RC4 TGS Ticket Harvest (T1558.003)</option>
-              <option value="lolbin">LOLBin Abuse — certutil/mshta/regsvr32 (T1218)</option>
-              <option value="wmi_persistence">WMI Event Subscription Persistence (T1546.003)</option>
-              <option value="dcsync">DCSync Attack — AD Replication Abuse (T1003.006)</option>
-              <option value="scheduled_task">Scheduled Task Persistence (T1053.005)</option>
-              </optgroup>
             </select>
           </div>
           <div style="display:flex;align-items:flex-end;">
@@ -528,59 +513,6 @@ NOT CommandLine CONTAINS "WindowsUpdate"</textarea>
     </div>
   </div>
 
-  <!-- SIGMA EXPORT PANEL -->
-  <div id="panel-sigma" class="panel">
-    <div class="page-header">
-      <div class="page-title">Sigma Rule Export</div>
-      <div class="page-sub">Download any detection rule as a Sigma YAML file — compatible with Splunk, Elastic, DNIF, QRadar, and 20+ other SIEMs</div>
-    </div>
-    <div class="card">
-      <div class="card-header">
-        <div class="card-title">Export Individual Rule</div>
-        <button class="btn-primary btn-sm" onclick="downloadAllSigma()">⬇ Download All Rules Bundle</button>
-      </div>
-      <div style="overflow-x:auto;">
-        <table>
-          <thead><tr><th>Rule ID</th><th>Name</th><th>MITRE</th><th>Severity</th><th>Export</th></tr></thead>
-          <tbody id="sigma-tbody"></tbody>
-        </table>
-      </div>
-    </div>
-    <div class="card" id="sigma-preview-card" style="display:none;">
-      <div class="card-header">
-        <div class="card-title" id="sigma-preview-title">Sigma Rule Preview</div>
-        <button class="btn-sm" onclick="document.getElementById('sigma-preview-card').style.display='none'">✕ Close</button>
-      </div>
-      <div class="card-body">
-        <pre id="sigma-preview-content" style="font-family:var(--font-mono);font-size:12px;color:var(--green);background:var(--bg);padding:14px;border-radius:var(--radius);overflow-x:auto;white-space:pre-wrap;"></pre>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-header"><div class="card-title">What is a Sigma Rule?</div></div>
-      <div class="card-body" style="font-size:13px;color:var(--text2);line-height:1.8;">
-        Sigma is a generic, open signature format for SIEM systems — like Snort/Yara for log files. A single Sigma rule can be converted to SPL (Splunk), KQL (Elastic), AQL (QRadar), or DNIF query syntax using the <span class="mono">sigma-cli</span> converter tool. This lets you write detection logic once and deploy across any SIEM platform.
-        <br><br>
-        <span style="color:var(--blue);">Convert to Splunk SPL:</span> <span class="mono">sigma convert -t splunk rule.yml</span><br>
-        <span style="color:var(--blue);">Convert to Elastic KQL:</span> <span class="mono">sigma convert -t es-qs rule.yml</span><br>
-        <span style="color:var(--blue);">Convert to QRadar AQL:</span> <span class="mono">sigma convert -t qradar rule.yml</span>
-      </div>
-    </div>
-  </div>
-
-  <!-- ATOMIC RED TEAM PANEL -->
-  <div id="panel-art" class="panel">
-    <div class="page-header">
-      <div class="page-title">Atomic Red Team Mapping</div>
-      <div class="page-sub">Each detection rule mapped to its Atomic Red Team test ID — run these tests to validate your detections fire correctly</div>
-    </div>
-    <div class="metrics" id="art-metrics">
-      <div class="metric"><div class="metric-label">Rules Mapped</div><div class="metric-value v-blue" id="art-total">—</div></div>
-      <div class="metric"><div class="metric-label">ART Tests Covered</div><div class="metric-value v-green" id="art-tests">—</div></div>
-      <div class="metric"><div class="metric-label">MITRE Techniques</div><div class="metric-value v-amber" id="art-techniques">—</div></div>
-    </div>
-    <div id="art-content"></div>
-  </div>
-
 </main>
 </div>
 
@@ -605,7 +537,7 @@ async function checkAPI() {
     const r = await fetch(API + '/api/health', {signal: AbortSignal.timeout(3000)});
     const d = await r.json();
     document.getElementById('api-pill').className = 'api-status online';
-    document.getElementById('api-status-text').textContent = `API v2 · ${d.rules_loaded} rules · ${d.techniques_mapped} techniques`;
+    document.getElementById('api-status-text').textContent = `API online · ${d.rules_loaded} rules`;
   } catch {
     document.getElementById('api-pill').className = 'api-status offline';
     document.getElementById('api-status-text').textContent = 'API offline — start Flask';
@@ -688,37 +620,7 @@ const PLAYBOOKS = {
     {h:"🚨 MAJOR INCIDENT — ALL HANDS", items:["Network-isolate affected hosts IMMEDIATELY","Do NOT reboot — encryption keys may be recoverable from RAM","Page on-call IR lead and management now"]},
     {h:"Scope Assessment", items:["Determine which file shares are affected (Event 4663 volume)","Check if DC and backup servers are also encrypted","Identify patient zero: how was the account originally compromised?"]},
     {h:"Recovery", items:["Restore from last verified clean backup (pre-infection timestamp)","Do not pay ransom — notify CERT-In and law enforcement","Forensic image all affected systems before any cleanup"]}
-  ], mitre:["T1486","T1490"], sev:"CRITICAL — MAJOR INCIDENT"},
-
-  kerberoasting: {steps: [
-    {h:"Immediate Triage", items:["Identify the user requesting RC4 tickets (Event 4769 + encryption type 0x17)","Check if this user has legitimate reason to query these service accounts","Determine if Rubeus or Impacket binaries exist on the host"]},
-    {h:"Investigation", items:["Pull all TGS requests from this user in last 24h — how many services targeted?","Check if any of the targeted service accounts have weak passwords (short, dictionary words)","Review Sysmon Event 1 for Rubeus.exe, GetUserSPNs.py, or PowerView execution"]},
-    {h:"Containment", items:["Reset passwords of all targeted service accounts to 25+ char random strings","Enable AES encryption on service accounts — disable RC4","Alert account owners and audit their account activity"]}
-  ], mitre:["T1558.003"], sev:"HIGH"},
-
-  lolbin: {steps: [
-    {h:"Immediate Triage", items:["Identify which LOLBin was abused (certutil/mshta/regsvr32)","Check if it made a network connection or downloaded a file","Capture the downloaded payload before it executes or is deleted"]},
-    {h:"Investigation", items:["Hash the downloaded file and check VirusTotal","Trace parent process — what spawned certutil/mshta?","Check Sysmon Event 11 for files created by the LOLBin process"]},
-    {h:"Containment", items:["Block the C2 URL/IP at proxy and firewall","Remove any dropped files","Hunt the same LOLBin command line across all endpoints in SIEM"]}
-  ], mitre:["T1218"], sev:"HIGH"},
-
-  wmi_persistence: {steps: [
-    {h:"Immediate Triage", items:["Identify the WMI consumer name and filter — Sysmon Event 19/20/21","Determine what command/script the consumer executes","Check creation time against known compromise timeline"]},
-    {h:"Investigation", items:["Enumerate all WMI subscriptions: Get-WMIObject -Namespace root\\subscription -Class __EventFilter","Identify the process that created the subscription (Sysmon process GUID)","Check for similar WMI subscriptions across all endpoints"]},
-    {h:"Containment", items:["Remove malicious subscription: Remove-WmiObject on Filter, Consumer, and Binding","Kill any active processes launched by the consumer","Hunt for other persistence: registry run keys, scheduled tasks, startup folder"]}
-  ], mitre:["T1546.003"], sev:"HIGH"},
-
-  dcsync: {steps: [
-    {h:"🚨 CRITICAL — Treat as Full Domain Compromise", items:["Assume all domain credentials are compromised","Begin krbtgt account double-reset procedure immediately","Notify CISO and activate IR plan"]},
-    {h:"Investigation", items:["Identify source host performing replication (Event 4662 + non-DC IP)","Determine what tool was used: mimikatz lsadump::dcsync, Impacket secretsdump","Check if Golden/Silver tickets have been created (look for Event 4769 anomalies post-attack)"]},
-    {h:"Recovery", items:["Reset krbtgt password TWICE (24h apart to invalidate all tickets)","Reset all privileged account passwords","Audit all accounts for backdoors, new admins, modified ACLs"]}
-  ], mitre:["T1003.006"], sev:"CRITICAL"},
-
-  scheduled_task: {steps: [
-    {h:"Immediate Triage", items:["Identify task name, scheduled time, and executing command","Check if task runs as SYSTEM or high-privilege account","Determine which process created the task (Sysmon Event 1 parent correlation)"]},
-    {h:"Investigation", items:["Review the task XML: schtasks /query /tn <taskname> /xml","Hash any executable referenced in the task and check VirusTotal","Check creation timestamp — does it align with other suspicious activity?"]},
-    {h:"Containment", items:["Delete the malicious task: schtasks /delete /tn <taskname> /f","Hunt for same task name or executable across all endpoints","Check for additional persistence: WMI, registry run keys, services"]}
-  ], mitre:["T1053.005"], sev:"HIGH"}
+  ], mitre:["T1486","T1490"], sev:"CRITICAL — MAJOR INCIDENT"}
 };
 
 async function runSimulation() {
@@ -899,98 +801,12 @@ async function loadRules() {
   } catch {}
 }
 
-
-// ─── SIGMA EXPORT ───
-async function loadSigmaTable() {
-  try {
-    const r = await fetch(API + '/api/rules');
-    const rules = await r.json();
-    const tbody = document.getElementById('sigma-tbody');
-    if (!tbody) return;
-    tbody.innerHTML = '';
-    rules.forEach(rule => {
-      const sevCls = {Critical:'b-red',High:'b-amber',Medium:'b-blue',Low:'b-green'}[rule.severity] || 'b-gray';
-      tbody.innerHTML += `<tr>
-        <td class="mono" style="font-size:11px;">${rule.rule_id}</td>
-        <td style="font-size:13px;">${rule.name}</td>
-        <td class="mono">${rule.mitre_id}</td>
-        <td><span class="badge ${sevCls}">${rule.severity}</span></td>
-        <td>
-          <button class="btn-sm" onclick="previewSigma('${rule.rule_id}','${rule.name}')">Preview</button>
-          <a href="${API}/api/sigma/${rule.rule_id}" download="${rule.rule_id}_sigma.yml">
-            <button class="btn-sm btn-primary" style="margin-left:6px;">⬇ .yml</button>
-          </a>
-        </td>
-      </tr>`;
-    });
-  } catch(e) {}
-}
-
-async function previewSigma(ruleId, ruleName) {
-  try {
-    const r = await fetch(API + '/api/sigma/' + ruleId);
-    const text = await r.text();
-    document.getElementById('sigma-preview-card').style.display = 'block';
-    document.getElementById('sigma-preview-title').textContent = ruleName + ' — Sigma YAML';
-    document.getElementById('sigma-preview-content').textContent = text;
-    document.getElementById('sigma-preview-card').scrollIntoView({behavior:'smooth'});
-  } catch { alert('API error — is Flask running?'); }
-}
-
-function downloadAllSigma() {
-  window.open(API + '/api/sigma-all', '_blank');
-}
-
-// ─── ATOMIC RED TEAM ───
-async function loadART() {
-  try {
-    const r = await fetch(API + '/api/atomic-red-team');
-    const d = await r.json();
-    let totalTests = 0;
-    const techniques = new Set();
-    d.mappings.forEach(m => { totalTests += m.art_tests.length; techniques.add(m.mitre); });
-    const el = document.getElementById('art-total');
-    if (el) el.textContent = d.total_rules;
-    const el2 = document.getElementById('art-tests');
-    if (el2) el2.textContent = totalTests;
-    const el3 = document.getElementById('art-techniques');
-    if (el3) el3.textContent = techniques.size;
-    const container = document.getElementById('art-content');
-    if (!container) return;
-    container.innerHTML = '';
-    d.mappings.forEach(m => {
-      const sevCls = {Critical:'b-red',High:'b-amber'}[m.severity] || 'b-blue';
-      container.innerHTML += `<div class="card">
-        <div class="card-header">
-          <div class="flex" style="gap:10px;">
-            <span class="badge b-blue">${m.rule_id}</span>
-            <div class="card-title">${m.rule_name}</div>
-            <span class="mono" style="font-size:11px;color:var(--text3);">${m.mitre}</span>
-          </div>
-        </div>
-        <div style="overflow-x:auto;">
-          <table>
-            <thead><tr><th>ART Test ID</th><th>Test Name</th><th>Executor</th><th>Run Command</th></tr></thead>
-            <tbody>${m.art_tests.map(t => `<tr>
-              <td class="mono">${t.test_id}</td>
-              <td style="font-size:13px;">${t.name}</td>
-              <td><span class="badge b-gray">${t.executor}</span></td>
-              <td><span class="mono" style="font-size:11px;color:var(--blue);">Invoke-AtomicTest ${t.test_id}</span></td>
-            </tr>`).join('')}</tbody>
-          </table>
-        </div>
-      </div>`;
-    });
-  } catch(e) {}
-}
-
 // ─── INIT ───
 checkAPI();
 loadIntel();
 loadMitre();
 loadRules();
-loadSigmaTable();
-loadART();
+// Refresh API status every 15s
 setInterval(checkAPI, 15000);
 </script>
 </body>
